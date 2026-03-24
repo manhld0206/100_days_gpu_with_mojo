@@ -31,4 +31,4 @@
     a. Full occupancy
     b. Limited by block
     c. Limited by register
-9. Maximum 32 * 32 = 1024 > 512 threads per block of the device so not possible to run
+9. Maximum 32 * 32 = 1024 > 512 threads per block of the device so not possible to run.
