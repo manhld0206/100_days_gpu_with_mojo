@@ -1,19 +1,22 @@
 from std.math import ceildiv
-from std.gpu import global_idx
+from std.gpu import (
+    global_idx,
+    block_idx,
+    thread_idx_uint as thread_idx,
+    barrier,
+)
 from std.gpu.host import DeviceContext
-
-
-@always_inline
-def cal_idx(row: Int, col: Int, h: Int) -> Int:
-    return row * h + col
+from std.gpu.memory import AddressSpace
+from std.memory import stack_allocation
 
 
 @always_inline
 def _matrix_mul_cal[
-    dtype: DType
+    dtype: DType,
+    address_space: AddressSpace = AddressSpace.GENERIC,
 ](
-    m: UnsafePointer[Scalar[dtype], ImmutExternalOrigin],
-    n: UnsafePointer[Scalar[dtype], ImmutExternalOrigin],
+    m: UnsafePointer[Scalar[dtype], ImmutExternalOrigin, address_space=address_space],
+    n: UnsafePointer[Scalar[dtype], ImmutExternalOrigin, address_space=address_space],
     row: Int,
     col: Int,
     width: Int
@@ -26,18 +29,56 @@ def _matrix_mul_cal[
 
 
 def matrix_mul_kernel[
-    dtype: DType
+    dtype: DType,
+    tile_width: Int,
 ](
     m: UnsafePointer[Scalar[dtype], ImmutExternalOrigin],
     n: UnsafePointer[Scalar[dtype], ImmutExternalOrigin],
     p: UnsafePointer[Scalar[dtype], MutExternalOrigin],
     width: Int,
 ):
-    row = Int(global_idx.x)
-    col = Int(global_idx.y)
+    var mds = stack_allocation[
+        tile_width**2,
+        Scalar[dtype],
+        address_space=AddressSpace.SHARED,
+    ]()
+    var nds = stack_allocation[
+        tile_width**2,
+        Scalar[dtype],
+        address_space=AddressSpace.SHARED,
+    ]()
 
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var row = tile_width * Int(block_idx.y) + ty
+    var col = tile_width * Int(block_idx.x) + tx
+
+    var p_value = Scalar[dtype](0)
+
+    var num_phases = ceildiv(width, tile_width)
+
+    for ph in range(num_phases):
+        if row < width and (ph * tile_width + tx) < width:
+            mds[ty * tile_width + tx] = m[row * width + ph * tile_width + tx]
+        else:
+            mds[ty * tile_width + tx] = 0
+
+        if (ph * tile_width + ty) < width and col < width:
+            nds[ty * tile_width + tx] = n[(ph * tile_width + ty) * width + col]
+        else:
+            nds[ty * tile_width + tx] = 0
+
+        barrier()
+
+        p_value += _matrix_mul_cal[dtype, AddressSpace.SHARED](
+            mds, nds, ty, tx, tile_width
+        )
+
+        barrier()
+
+    # Write result to global memory with boundary check
     if row < width and col < width:
-        p[row * width + col] = _matrix_mul_cal[dtype](m, n, row, col, width)
+        p[row * width + col] = p_value
 
 
 def matrix_mul_gpu[
@@ -58,11 +99,12 @@ def matrix_mul_gpu[
 
     comptime block_dim_x = 32
     comptime block_dim_y = 32
+    comptime tile_width = 32
     var grid_dim_x = ceildiv(width, block_dim_x)
     var grid_dim_y = grid_dim_x
 
     # Launch kernel
-    ctx.enqueue_function[matrix_mul_kernel[dtype], matrix_mul_kernel[dtype]](
+    ctx.enqueue_function[matrix_mul_kernel[dtype, tile_width], matrix_mul_kernel[dtype, tile_width]](
         d_m,
         d_n,
         d_p,
@@ -94,7 +136,6 @@ def matrix_mul_cpu[
 def main() raises:
     var width: Int = 1000
 
-    comptime blur_size = 3
     comptime dtype = DType.float32
 
     # Allocate host memory
@@ -105,8 +146,8 @@ def main() raises:
 
     # Initialize input_data arrays
     for i in range(width**2):
-        m[i] = Float32(i)
-        n[i] = Float32(i+1)
+        m[i] = Scalar[dtype](i) % 100
+        n[i] = Scalar[dtype](i+1) % 100
 
     # Compute on GPU
     with DeviceContext() as ctx:

@@ -4,11 +4,6 @@ from std.gpu.host import DeviceContext
 
 
 @always_inline
-def cal_idx(row: Int, col: Int, h: Int) -> Int:
-    return row * h + col
-
-
-@always_inline
 def _matrix_mul_cal[
     dtype: DType
 ](
@@ -94,7 +89,6 @@ def matrix_mul_cpu[
 def main() raises:
     var width: Int = 1000
 
-    comptime blur_size = 3
     comptime dtype = DType.float32
 
     # Allocate host memory
@@ -105,8 +99,8 @@ def main() raises:
 
     # Initialize input_data arrays
     for i in range(width**2):
-        m[i] = Float32(i)
-        n[i] = Float32(i+1)
+        m[i] = Scalar[dtype](i) % 100
+        n[i] = Scalar[dtype](i+1) % 100
 
     # Compute on GPU
     with DeviceContext() as ctx:
