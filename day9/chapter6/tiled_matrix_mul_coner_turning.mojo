@@ -15,11 +15,15 @@ def _matrix_mul_cal[
     dtype: DType,
     address_space: AddressSpace = AddressSpace.GENERIC,
 ](
-    m: UnsafePointer[Scalar[dtype], ImmutExternalOrigin, address_space=address_space],
-    n: UnsafePointer[Scalar[dtype], ImmutExternalOrigin, address_space=address_space],
+    m: UnsafePointer[
+        Scalar[dtype], ImmutExternalOrigin, address_space=address_space
+    ],
+    n: UnsafePointer[
+        Scalar[dtype], ImmutExternalOrigin, address_space=address_space
+    ],
     row: Int,
     col: Int,
-    width: Int
+    width: Int,
 ) -> Scalar[dtype]:
     var result: Scalar[dtype] = 0
     for k in range(width):
@@ -31,6 +35,7 @@ def _matrix_mul_cal[
 def matrix_mul_kernel[
     dtype: DType,
     tile_width: Int,
+    is_n_tranpose: Bool = False,
 ](
     m: UnsafePointer[Scalar[dtype], ImmutExternalOrigin],
     n: UnsafePointer[Scalar[dtype], ImmutExternalOrigin],
@@ -64,7 +69,14 @@ def matrix_mul_kernel[
             mds[ty * tile_width + tx] = 0
 
         if (ph * tile_width + ty) < width and col < width:
-            nds[ty * tile_width + tx] = n[(ph * tile_width + ty) * width + col]
+            comptime if is_n_tranpose:
+                nds[ty * tile_width + tx] = n[
+                    col * width + ph * tile_width + ty
+                ]
+            else:
+                nds[ty * tile_width + tx] = n[
+                    (ph * tile_width + ty) * width + col
+                ]
         else:
             nds[ty * tile_width + tx] = 0
 
@@ -82,7 +94,8 @@ def matrix_mul_kernel[
 
 
 def matrix_mul_gpu[
-    dtype: DType
+    dtype: DType,
+    is_n_transpose: Bool = False,
 ](
     m: UnsafePointer[Scalar[dtype], ImmutExternalOrigin],
     n: UnsafePointer[Scalar[dtype], ImmutExternalOrigin],
@@ -104,7 +117,10 @@ def matrix_mul_gpu[
     var grid_dim_y = grid_dim_x
 
     # Launch kernel
-    ctx.enqueue_function[matrix_mul_kernel[dtype, tile_width], matrix_mul_kernel[dtype, tile_width]](
+    ctx.enqueue_function[
+        matrix_mul_kernel[dtype, tile_width, is_n_transpose],
+        matrix_mul_kernel[dtype, tile_width, is_n_transpose],
+    ](
         d_m,
         d_n,
         d_p,
@@ -141,17 +157,22 @@ def main() raises:
     # Allocate host memory
     var m = alloc[Scalar[dtype]](width**2)
     var n = alloc[Scalar[dtype]](width**2)
+    var n_transpose = alloc[Scalar[dtype]](width**2)
     var p_gpu = alloc[Scalar[dtype]](width**2)
     var p_cpu = alloc[Scalar[dtype]](width**2)
 
     # Initialize input_data arrays
     for i in range(width**2):
         m[i] = Scalar[dtype](i) % 100
-        n[i] = Scalar[dtype](i+1) % 100
+        n[i] = Scalar[dtype](i + 1) % 100
+
+    for i in range(width):
+        for j in range(width):
+            n_transpose[j * width + i] = n[i * width + j]
 
     # Compute on GPU
     with DeviceContext() as ctx:
-        matrix_mul_gpu[dtype](m, n, p_gpu, width, ctx)
+        matrix_mul_gpu[dtype, True](m, n_transpose, p_gpu, width, ctx)
 
     # Compute on CPU
     matrix_mul_cpu[dtype](m, n, p_cpu, width)
