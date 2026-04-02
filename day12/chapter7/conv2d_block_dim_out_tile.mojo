@@ -10,7 +10,7 @@ from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 
 
-def conv2d_block_dim_in_tile_kernel[
+def conv2d_block_dim_out_tile_kernel[
     dtype: DType,
     block_dim: Int,
     filter_radius: Int,
@@ -22,35 +22,62 @@ def conv2d_block_dim_in_tile_kernel[
     height: Int,
 ):
     comptime filter_width = 2 * filter_radius + 1
-    comptime out_dim = block_dim - 2 * filter_radius
+    comptime in_dim = block_dim + 2 * filter_radius
 
-    var col = block_idx.x * out_dim + thread_idx.x - filter_radius
-    var row = block_idx.y * out_dim + thread_idx.y - filter_radius
+    var n_col = block_idx.x * block_dim + thread_idx.x
+    var n_row = block_idx.y * block_dim + thread_idx.y
 
     var nds = stack_allocation[
-        block_dim**2,
+        in_dim**2,
         Scalar[dtype],
         address_space=AddressSpace.SHARED,
     ]()
 
-    if col < width and col >= 0 and row < height and row >=0:
-        nds[thread_idx.y * block_dim + thread_idx.x] = n[row * width + col]
-    else:
-        nds[thread_idx.y * block_dim + thread_idx.x] = Scalar[dtype](0)
+    var nds_col = thread_idx.x + filter_radius
+    var nds_row = thread_idx.y + filter_radius
+
+    @parameter
+    def _load_nds(nds_c: Int, nds_r: Int, n_c: Int, n_r: Int):
+        if n_r < height and n_r >=0 and n_c < width and n_c >= 0:
+            nds[nds_r * in_dim + nds_c] = n[n_r * width + n_c]
+        else:
+            nds[nds_r * in_dim + nds_c] = Scalar[dtype](0)
+
+    _load_nds(nds_col, nds_row, n_col, n_row)
+
+    if nds_col - filter_radius < filter_radius and nds_row - filter_radius < filter_radius:
+        _load_nds(nds_col - filter_radius, nds_row - filter_radius, n_col - filter_radius, n_row - filter_radius)
+
+    if nds_col - filter_radius < filter_radius:
+        _load_nds(nds_col - filter_radius, nds_row, n_col - filter_radius, n_row)
+
+    if nds_col - filter_radius < filter_radius and nds_row + filter_radius < in_dim:
+        _load_nds(nds_col - filter_radius, nds_row + filter_radius, n_col - filter_radius, n_row + filter_radius)
+
+    if nds_row + filter_radius < in_dim:
+        _load_nds(nds_col, nds_row + filter_radius, n_col, n_row + filter_radius)
+
+    if nds_col + filter_radius < in_dim and nds_row + filter_radius < in_dim:
+        _load_nds(nds_col + filter_radius, nds_row + filter_radius, n_col + filter_radius, n_row + filter_radius)
+
+    if nds_col + filter_radius < in_dim:
+        _load_nds(nds_col + filter_radius, nds_row, n_col + filter_radius, n_row)
+
+    if nds_col + filter_radius < in_dim and nds_row - filter_radius < filter_radius:
+        _load_nds(nds_col + filter_radius, nds_row - filter_radius, n_col + filter_radius, n_row - filter_radius)
+
+    if nds_row - filter_radius < filter_radius:
+        _load_nds(nds_col, nds_row - filter_radius, n_col, n_row - filter_radius)
 
     barrier()
 
-    if col < width and col >= 0 and row < height and row >=0:
-        tile_col = thread_idx.x - filter_radius
-        tile_row = thread_idx.y - filter_radius
+    if n_col < width and n_col >= 0 and n_row < height and n_row >=0:
+        p_value = Scalar[dtype](0)
+        comptime for dr in range(-filter_radius, filter_radius + 1):
+            comptime for dc in range(-filter_radius, filter_radius + 1):
+                p_value += nds[(nds_row + dr) * in_dim + nds_col + dc] * f[(filter_radius + dr) * filter_width + filter_radius + dc]
 
-        if tile_col >= 0 and tile_col < out_dim and tile_row >= 0 and tile_row < out_dim:
-            p_value = Scalar[dtype](0)
-            for i in range(filter_width):
-                for j in range(filter_width):
-                    p_value += nds[(tile_row + i) * block_dim + tile_col + j] * f[i * filter_width + j]
-
-            p[row * width + col] = p_value
+        p[n_row * width + n_col] = p_value
 
 
 def conv2d_gpu[
@@ -65,7 +92,6 @@ def conv2d_gpu[
     ctx: DeviceContext
 ) raises:
     comptime block_dim = 32
-    comptime out_dim = block_dim - 2 * filter_radius
 
     var d_n = ctx.enqueue_create_buffer[dtype](width*height)
     var d_p = ctx.enqueue_create_buffer[dtype](width*height)
@@ -73,13 +99,13 @@ def conv2d_gpu[
     ctx.enqueue_copy(d_n, n)
     ctx.enqueue_copy(d_p, p)
 
-    var grid_dim_x = ceildiv(width, out_dim)
-    var grid_dim_y = ceildiv(height, out_dim)
+    var grid_dim_x = ceildiv(width, block_dim)
+    var grid_dim_y = ceildiv(height, block_dim)
 
     # Launch kernel
     ctx.enqueue_function[
-        conv2d_block_dim_in_tile_kernel[dtype, block_dim, filter_radius],
-        conv2d_block_dim_in_tile_kernel[dtype, block_dim, filter_radius],
+        conv2d_block_dim_out_tile_kernel[dtype, block_dim, filter_radius],
+        conv2d_block_dim_out_tile_kernel[dtype, block_dim, filter_radius],
     ](
         d_n,
         f,
