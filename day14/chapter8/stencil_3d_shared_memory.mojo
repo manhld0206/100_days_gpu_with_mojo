@@ -21,7 +21,6 @@ from std.itertools import product
 comptime Layout3D = Layout.row_major(
     UNKNOWN_VALUE, UNKNOWN_VALUE, UNKNOWN_VALUE
 )
-comptime STENCIL_WIDTH = 7
 
 
 def stencil_3d_kernel[
