@@ -6,9 +6,13 @@ from std.gpu import (
     grid_dim,
     thread_idx,
     barrier,
+    warp_id,
+    lane_id,
+    WARP_SIZE,
 )
 from std.gpu.host import DeviceContext
 from std.gpu.memory import AddressSpace
+from std.gpu.primitives.warp import shuffle_down
 from std.memory import stack_allocation
 from layout import (
     UNKNOWN_VALUE,
@@ -20,25 +24,58 @@ from layout import (
 from std.utils.index import Index
 from std.itertools import product
 from std.os.atomic import Atomic
+from std.bit import log2_floor
+
+
+def warp_reduce[
+    dtype: DType, simd_width: Int
+](val: SIMD[dtype, simd_width]) -> SIMD[dtype, simd_width]:
+    var partial_sum = val
+
+    # Unrolled warp reduction
+    comptime LOG2_WARP_SIZE = log2_floor(WARP_SIZE)
+
+    comptime for i in range(LOG2_WARP_SIZE):
+        comptime offset = 1 << (LOG2_WARP_SIZE - 1 - i)
+        partial_sum += shuffle_down(partial_sum, UInt32(offset))
+
+    return partial_sum
 
 
 def sum_reduction_kernel[
-    dtype: DType
+    dtype: DType,
+    block_dim: Int,
 ](
     input: LayoutTensor[dtype, Layout.row_major(UNKNOWN_VALUE), MutAnyOrigin],
     output: UnsafePointer[Scalar[dtype], MutExternalOrigin],
 ):
     var i = thread_idx.x
-    var stride = block_dim.x
-    while stride >= 1:
-        if thread_idx.x < stride:
-            input[i] += input[i + stride]
+    var stride = block_dim
+    var warp_idx = warp_id()
 
-        stride /= 2
-        barrier()
+    var partial_sum = input[i] + input[i + stride]
+    partial_sum = warp_reduce(partial_sum)
 
-    if thread_idx.x == 0:
-        output[0] = input[0][0]
+    var partial_sum_s = LayoutTensor[
+        dtype,
+        Layout.row_major(block_dim/WARP_SIZE),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    if lane_id() == 0:
+        partial_sum_s[warp_idx] = partial_sum
+
+    barrier()
+
+    if warp_idx == 0:
+        if i < block_dim/WARP_SIZE:
+            partial_sum = partial_sum_s[i]
+        else:
+            partial_sum = 0
+        partial_sum = warp_reduce(partial_sum)
+        if thread_idx.x == 0:
+            output[0] = partial_sum[0]
 
 
 def sum_reduction_gpu[
@@ -49,8 +86,7 @@ def sum_reduction_gpu[
     n: Int,
     ctx: DeviceContext,
 ) raises:
-    # comptime block_dim = 32
-    var block_dim = n/2
+    comptime block_dim = 512
 
     var layout = RuntimeLayout[Layout.row_major(UNKNOWN_VALUE)].row_major(
         Index(n)
@@ -70,8 +106,8 @@ def sum_reduction_gpu[
 
     # Launch kernel
     ctx.enqueue_function[
-        sum_reduction_kernel[dtype],
-        sum_reduction_kernel[dtype],
+        sum_reduction_kernel[dtype, block_dim],
+        sum_reduction_kernel[dtype, block_dim],
     ](
         input_tensor,
         d_output,
@@ -111,7 +147,7 @@ def main() raises:
 
     # Initialize image arrays
     for i in range(n):
-        input[i] = 2
+        input[i] = Int32((i + 7)%100)
 
     # Compute on GPU
     with DeviceContext() as ctx:
