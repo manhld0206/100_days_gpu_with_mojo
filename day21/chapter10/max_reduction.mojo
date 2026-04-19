@@ -23,7 +23,7 @@ from layout import (
 )
 from std.utils.index import Index
 from std.itertools import product
-from std.os.atomic import Atomic
+from std.atomic import Atomic
 from std.bit import log2_floor
 from std.math import max
 from std.utils.numerics import min_or_neg_inf
